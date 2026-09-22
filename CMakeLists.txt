@@ -13,6 +13,7 @@ add_compile_options(-Wall -Wextra -O2)
 add_executable(lsmstore
     src/main.cpp
     src/wal.cpp
+    src/sstable.cpp
 )
 
 target_include_directories(lsmstore PRIVATE include)

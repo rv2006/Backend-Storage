@@ -12,7 +12,7 @@ are built on: how writes get made durable, how data gets kept sorted
 without paying the cost of sorting on every write, and how a background
 process cleans up after itself so reads stay fast over time.
 
-## Current status: Phase 1 (durable in-memory store)
+## Current status: Phase 2 (SSTable flush)
 
 What's implemented and working right now:
 
@@ -22,31 +22,38 @@ What's implemented and working right now:
   returns "OK", that write is guaranteed to survive.
 - **Skip List memtable (`skiplist.hpp`)** — the in-memory sorted
   structure that serves reads and writes. Deletes are tombstoned rather
-  than physically removed, since a future SSTable layer needs that
-  history to correctly shadow older on-disk values.
-- **Crash recovery** — on startup, the WAL is replayed in order to
-  rebuild the memtable exactly as it was before shutdown/crash. Verified
-  by killing the process mid-session and confirming all writes survive
-  restart.
+  than physically removed, since SSTables need that history to correctly
+  shadow older on-disk values.
+- **SSTable flush (`sstable.hpp` / `sstable.cpp`)** — once the memtable
+  crosses a size threshold, its sorted contents are written to an
+  immutable, sorted file on disk (a Sorted String Table), and a fresh
+  memtable + WAL take over. This is what makes the engine an actual
+  LSM-tree rather than just a durable in-memory store: data can now
+  exceed what fits in RAM.
+- **Multi-file reads** — `GET` checks the memtable first (it always holds
+  the most recent writes), then falls back to scanning SSTables
+  newest-to-oldest, stopping at the first file that has any record
+  (live or tombstoned) for the key. Verified: a key updated across two
+  separate flushes correctly resolves to the value in the newer file.
+- **Crash recovery, extended** — on startup, the engine now rediscovers
+  existing SSTable files on disk (by scanning for `sstable_NNNN.dat`)
+  *and* replays the WAL to rebuild whatever memtable state hadn't been
+  flushed yet. Verified across a restart with both an on-disk SSTable and
+  unflushed WAL data present simultaneously.
 - **CLI (`main.cpp`)** — a REPL for `SET`, `GET`, `DEL`, `COUNT`.
-
-Everything currently lives in memory (rebuilt from the WAL on every
-start). That's intentional — it's the honest, fully-working "phase 1"
-rather than a half-built version of the whole thing.
 
 ## Roadmap (in build order)
 
-1. **SSTable flush** — once the memtable crosses a size threshold, write
-   its sorted contents to an immutable on-disk file (Sorted String
-   Table) and start a fresh memtable + WAL. This is what lets the engine
-   hold more data than fits in RAM.
-2. **Multi-file reads** — `GET` needs to check the memtable, then scan
-   SSTables newest-to-oldest until it finds the key (or exhausts them).
+1. ~~**SSTable flush**~~ — done.
+2. ~~**Multi-file reads**~~ — done.
 3. **Bloom filters** — one per SSTable, to skip files that provably don't
-   contain a key instead of reading them off disk.
+   contain a key instead of reading them off disk. Right now every GET
+   that misses the memtable does a linear scan (with early exit) through
+   every SSTable file — this is the next real inefficiency to fix.
 4. **Compaction** — background merging of old SSTables into fewer,
    cleaner files, dropping tombstoned/superseded entries. This is the
-   hardest and most interesting part of the whole system.
+   hardest and most interesting part of the whole system. Right now
+   SSTables just pile up forever with no cleanup.
 5. **Benchmarking** — throughput numbers (writes/sec, reads/sec) using
    Google Benchmark, and a short write-up of the write/read/space
    amplification tradeoffs this design makes.
@@ -56,7 +63,7 @@ rather than a half-built version of the whole thing.
 Requires a C++17 compiler. No external dependencies for the core engine.
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp -o lsmstore
+g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp -o lsmstore
 ./lsmstore
 ```
 
@@ -81,26 +88,61 @@ OK
 > GET name
 (not found)
 > COUNT
-0 entries
+0 entries in memtable, 0 SSTable file(s) on disk
 > EXIT
 ```
 
+The flush threshold is deliberately small (5 entries — see
+`FLUSH_THRESHOLD` in `main.cpp`) so you can trigger and observe a flush
+by hand in the REPL instead of needing thousands of writes:
+
+```
+> SET a 1
+OK
+> SET b 2
+OK
+> SET c 3
+OK
+> SET d 4
+OK
+> SET e 5
+OK
+(flushed memtable -> sstable_0000.dat)
+> GET a
+1
+```
+`GET a` here is served entirely from the SSTable on disk — the memtable
+was just reset to empty by the flush.
+
 Kill the process (Ctrl+C) mid-session and restart — every write that
-returned "OK" will still be there, replayed from the WAL.
+returned "OK" will still be there: flushed data comes back from the
+rediscovered SSTable files, unflushed data comes back from the WAL.
 
 ## Design notes / talking points
 
-- **On-disk WAL record format** is fixed-width and hand-rolled (no
-  serialization library): `[1 byte op][4 byte key_len][4 byte val_len]
-  [key bytes][value bytes]`. No checksums yet — a natural hardening step
-  is adding a CRC32 per record so a torn write at the tail (from a crash
-  mid-append) can be detected and the log truncated cleanly during
-  replay instead of risking corrupt recovery.
-- **Why tombstones instead of physical delete**: once data can live
-  across multiple immutable SSTable files, a `DELETE` has to be able to
-  "shadow" a value that already exists in an older file. Physically
-  removing the key from the memtable would lose that information and a
-  stale value could resurface from an older SSTable on read.
+- **On-disk WAL and SSTable record formats** are fixed-width and
+  hand-rolled (no serialization library). No checksums yet — a natural
+  hardening step is adding a CRC32 per record so a torn write at the tail
+  (from a crash mid-append) can be detected and the log/file truncated
+  cleanly during replay/read instead of risking corrupt recovery.
+- **Why tombstones instead of physical delete**: once data lives across
+  multiple immutable SSTable files, a `DELETE` has to be able to "shadow"
+  a value that already exists in an older file. Physically removing the
+  key from the memtable — or from an SSTable, which can't be edited at
+  all — would lose that information and a stale value could resurface on
+  read.
+- **Why SSTables are immutable**: once written, a file is never edited in
+  place. An update to an existing key is handled by writing a *newer*
+  record (in the memtable, then a newer SSTable) that shadows the old
+  one on read, rather than mutating the old file. This is what makes
+  compaction (Phase 4) a distinct, separable step instead of something
+  that has to happen synchronously on every write.
+- **Why point lookups do a linear scan with early exit, for now**: SSTable
+  entries are sorted, so a lookup can stop scanning the moment it passes
+  the target key alphabetically — it doesn't need to read the rest of the
+  file. This is still O(n) in the worst case though; a bloom filter
+  (Phase 3) is what lets a lookup skip opening a file entirely when the
+  key provably isn't in it.
 - **Why a skip list over `std::map`**: comparable O(log n) average-case
   performance, but a much simpler mental model, and it extends more
   naturally to lock-free / fine-grained-locking concurrent versions
