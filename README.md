@@ -12,7 +12,11 @@ are built on: how writes get made durable, how data gets kept sorted
 without paying the cost of sorting on every write, and how a background
 process cleans up after itself so reads stay fast over time.
 
-## Current status: Phase 2 (SSTable flush)
+## Current status: Phase 2 of 4 complete (~35-40%)
+
+Durability and on-disk persistence are done. What's left — bloom
+filters and, especially, compaction — is where most of the remaining
+engineering complexity actually lives.
 
 What's implemented and working right now:
 
@@ -57,6 +61,11 @@ What's implemented and working right now:
 5. **Benchmarking** — throughput numbers (writes/sec, reads/sec) using
    Google Benchmark, and a short write-up of the write/read/space
    amplification tradeoffs this design makes.
+
+Compaction is the single largest remaining chunk of work — merging
+multiple SSTables correctly while data is actively being written and
+read is the hardest problem in this whole project, and it's also the
+part most worth being able to explain end to end.
 
 ## Building
 
