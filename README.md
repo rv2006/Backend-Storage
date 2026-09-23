@@ -12,11 +12,11 @@ are built on: how writes get made durable, how data gets kept sorted
 without paying the cost of sorting on every write, and how a background
 process cleans up after itself so reads stay fast over time.
 
-## Current status: Phase 3 of 4 complete (~55-60%)
+## Current status: Phase 4 of 4 complete (~85-90%) — core architecture done
 
-Durability, on-disk persistence, and fast negative lookups are done.
-Compaction is the one major piece left, and it's the hardest part of
-the whole project.
+Every stage of the LSM-tree loop is implemented and working: memtable →
+WAL → SSTable → bloom filter → compaction. What's left is benchmarking
+and polish, not new architecture.
 
 What's implemented and working right now:
 
@@ -53,6 +53,19 @@ What's implemented and working right now:
   older SSTable correctly skips a newer SSTable's file via its filter
   before finding the right value, both in the same session and after a
   restart with filters loaded fresh from disk.
+- **Compaction (`compaction.hpp` / `compaction.cpp`)** — once the number
+  of on-disk SSTables crosses a threshold, they're all merged into a
+  single new SSTable: duplicate keys resolve to their newest value, and
+  tombstones are dropped entirely (safe here because this is a *full*
+  merge — nothing older is left outside it for a tombstone to still need
+  to shadow). The new merged file and its bloom filter are written and
+  durably synced to disk *before* the old files are deleted, so a crash
+  mid-compaction leaves the still-correct old SSTables in place instead
+  of losing data. Verified: 4 SSTables (20 raw entries, including one
+  overwritten key and one deleted key) compact down to 17 live entries
+  in a single file, the old files are actually removed from disk, and
+  every key — including the overwritten and deleted ones — resolves
+  correctly both immediately after compaction and after a restart.
 - **CLI (`main.cpp`)** — a REPL for `SET`, `GET`, `DEL`, `COUNT`.
 
 ## Roadmap (in build order)
@@ -60,25 +73,20 @@ What's implemented and working right now:
 1. ~~**SSTable flush**~~ — done.
 2. ~~**Multi-file reads**~~ — done.
 3. ~~**Bloom filters**~~ — done.
-4. **Compaction** — background merging of old SSTables into fewer,
-   cleaner files, dropping tombstoned/superseded entries. This is the
-   hardest and most interesting part of the whole system. Right now
-   SSTables just pile up forever with no cleanup.
+4. ~~**Compaction**~~ — done. Currently a *full* compaction (all SSTables
+   merged in one shot) rather than the tiered/leveled strategies real
+   engines use to avoid re-merging the whole dataset every time — a
+   natural next hardening step, not required for the core story.
 5. **Benchmarking** — throughput numbers (writes/sec, reads/sec) using
    Google Benchmark, and a short write-up of the write/read/space
-   amplification tradeoffs this design makes.
-
-Compaction is the single largest remaining chunk of work — merging
-multiple SSTables correctly while data is actively being written and
-read is the hardest problem in this whole project, and it's also the
-part most worth being able to explain end to end.
+   amplification tradeoffs this design makes. This is what's left.
 
 ## Building
 
 Requires a C++17 compiler. No external dependencies for the core engine.
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp src/bloomfilter.cpp -o lsmstore
+g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp src/bloomfilter.cpp src/compaction.cpp -o lsmstore
 ./lsmstore
 ```
 
@@ -171,6 +179,21 @@ rediscovered SSTable files, unflushed data comes back from the WAL.
   persistence. Fixed by writing the exact `num_bits` used at build time
   into the filter file and reusing that same value on reload, instead of
   re-deriving it from the padded byte array.
+- **Compaction's crash-safety ordering, and a related fix.** Compaction
+  writes the merged SSTable and its bloom filter *completely*, syncs
+  them to disk, and only then deletes the old files. If the process dies
+  midway, you're left with either the full old set (delete never
+  happened) or the full old set plus a harmless finished new file (delete
+  was about to happen) — never a half-merged, half-deleted mess. That
+  ordering is only a real guarantee if "written" actually means
+  durable, though: `writeSSTable()` originally only called `flush()`
+  and `close()`, which pushes data out of the C++ stream buffer but
+  doesn't force the OS to commit it to disk. Under real power loss (not
+  just a process crash), that gap meant the "new file is safe before we
+  delete the old ones" promise wasn't actually true. Fixed by giving
+  `writeSSTable()` the same `fsync`-equivalent call the WAL already
+  used, so both the durability boundary and the crash-safety ordering
+  compaction relies on are real, not just implied.
 - **Why a skip list over `std::map`**: comparable O(log n) average-case
   performance, but a much simpler mental model, and it extends more
   naturally to lock-free / fine-grained-locking concurrent versions

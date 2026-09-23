@@ -2,15 +2,20 @@
 //
 // A REPL on top of the storage engine core: WAL (durability) + SkipList
 // (in-memory memtable) + SSTable (on-disk flush) + BloomFilter (skip
-// SSTables that provably don't contain a key).
+// SSTables that provably don't contain a key) + Compaction (merge old
+// SSTables back into one).
 //
-// This is "phase 3": every SSTable now gets a bloom filter built and
-// saved alongside it when it's flushed. GET checks the filter before
-// scanning a file -- a "definitely not present" answer skips the disk
-// read entirely instead of opening the file and scanning it.
+// This is "phase 4": once the number of on-disk SSTables crosses a
+// threshold, they're all merged into a single new SSTable -- duplicate
+// keys resolved to their newest value, tombstones dropped entirely
+// (safe here because this is a *full* compaction: nothing is left
+// outside the merge for a tombstone to still need to shadow). This is
+// what keeps SSTables from piling up forever and keeps GET from having
+// to check more and more files as the engine runs.
 //
-// Still missing (see README roadmap): compaction (to merge/clean up old
-// SSTables instead of letting them pile up forever).
+// This completes the core LSM-tree loop: memtable -> WAL -> SSTable ->
+// bloom filter -> compaction. What's left (see README roadmap) is
+// benchmarking and polish, not new architecture.
 //
 // Commands:
 //   SET <key> <value>
@@ -23,6 +28,7 @@
 #include "wal.hpp"
 #include "sstable.hpp"
 #include "bloomfilter.hpp"
+#include "compaction.hpp"
 #include <iostream>
 #include <sstream>
 #include <memory>
@@ -37,6 +43,10 @@ namespace fs = std::filesystem;
 // Kept small on purpose so flushing is easy to trigger and observe by
 // hand in the REPL. A real engine would size this in MB, not entry count.
 constexpr size_t FLUSH_THRESHOLD = 5;
+
+// Also kept small so a compaction is easy to trigger by hand. Once the
+// number of on-disk SSTables reaches this, they all get merged into one.
+constexpr size_t COMPACTION_THRESHOLD = 4;
 
 const std::string kSSTablePrefix = "sstable_";
 const std::string kSSTableSuffix = ".dat";
@@ -159,6 +169,42 @@ int main() {
         std::cout << "(flushed memtable -> " << path << ", bloom filter written)\n";
     };
 
+    auto compactIfNeeded = [&]() {
+        if (sstables.size() < COMPACTION_THRESHOLD) return;
+
+        size_t files_before = sstables.size();
+        CompactionResult merged = mergeSSTables(sstables);
+
+        std::string new_path = sstablePath(next_sstable_id++);
+        writeSSTable(new_path, merged.entries);
+
+        BloomFilter filter(merged.entries.size());
+        for (const auto& e : merged.entries) {
+            filter.add(e.key);
+        }
+        filter.saveToFile(filterPath(new_path));
+
+        // Only now, after the merged file and its filter are safely on
+        // disk, remove the old files and their filter sidecars. Doing
+        // the delete last means a crash mid-compaction leaves the old
+        // (still-correct) SSTables in place rather than losing data.
+        for (const auto& old_path : sstables) {
+            std::error_code ec;
+            fs::remove(old_path, ec);
+            fs::remove(filterPath(old_path), ec);
+            filters.erase(old_path);
+        }
+
+        sstables.clear();
+        sstables.push_back(new_path);
+        filters.emplace(new_path, std::move(filter));
+
+        std::cout << "(compacted " << files_before << " SSTables -> " << new_path
+                   << ": " << merged.input_entry_count << " entries in -> "
+                   << merged.entries.size() << " live entries out, "
+                   << merged.tombstones_dropped << " tombstone(s) dropped)\n";
+    };
+
     std::string line;
     while (true) {
         std::cout << "> ";
@@ -186,6 +232,7 @@ int main() {
             std::cout << "OK\n";
             if (memtable->approxEntryCount() >= FLUSH_THRESHOLD) {
                 flushMemtable();
+                compactIfNeeded();
             }
         } else if (cmd == "GET") {
             std::string key;
@@ -233,6 +280,7 @@ int main() {
             std::cout << "OK\n";
             if (memtable->approxEntryCount() >= FLUSH_THRESHOLD) {
                 flushMemtable();
+                compactIfNeeded();
             }
         } else if (cmd == "COUNT") {
             std::cout << memtable->approxEntryCount() << " entries in memtable, "

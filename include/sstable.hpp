@@ -53,3 +53,9 @@ void writeSSTable(const std::string& path, const std::vector<SkipList::Entry>& e
 // Returns {value, tombstone} if found, std::nullopt if the key never
 // appears in this particular file at all.
 std::optional<std::pair<std::string, bool>> lookupSSTable(const std::string& path, const std::string& key);
+
+// Reads every entry out of the SSTable at `path`, in the sorted order
+// they're stored in. Used by compaction, which needs the full contents
+// of several SSTables at once to merge them -- a point lookup isn't
+// enough there.
+std::vector<SkipList::Entry> readAllEntries(const std::string& path);
