@@ -12,11 +12,11 @@ are built on: how writes get made durable, how data gets kept sorted
 without paying the cost of sorting on every write, and how a background
 process cleans up after itself so reads stay fast over time.
 
-## Current status: Phase 2 of 4 complete (~35-40%)
+## Current status: Phase 3 of 4 complete (~55-60%)
 
-Durability and on-disk persistence are done. What's left — bloom
-filters and, especially, compaction — is where most of the remaining
-engineering complexity actually lives.
+Durability, on-disk persistence, and fast negative lookups are done.
+Compaction is the one major piece left, and it's the hardest part of
+the whole project.
 
 What's implemented and working right now:
 
@@ -44,16 +44,22 @@ What's implemented and working right now:
   *and* replays the WAL to rebuild whatever memtable state hadn't been
   flushed yet. Verified across a restart with both an on-disk SSTable and
   unflushed WAL data present simultaneously.
+- **Bloom filters (`bloomfilter.hpp` / `bloomfilter.cpp`)** — every
+  SSTable gets a bloom filter built at flush time and saved alongside it
+  as a `.filter` sidecar file. `GET` checks the filter before opening an
+  SSTable; a "definitely not present" result skips the file entirely
+  instead of scanning it. Filters are reloaded from disk on restart
+  rather than rebuilt. Verified: a lookup for a key that exists in an
+  older SSTable correctly skips a newer SSTable's file via its filter
+  before finding the right value, both in the same session and after a
+  restart with filters loaded fresh from disk.
 - **CLI (`main.cpp`)** — a REPL for `SET`, `GET`, `DEL`, `COUNT`.
 
 ## Roadmap (in build order)
 
 1. ~~**SSTable flush**~~ — done.
 2. ~~**Multi-file reads**~~ — done.
-3. **Bloom filters** — one per SSTable, to skip files that provably don't
-   contain a key instead of reading them off disk. Right now every GET
-   that misses the memtable does a linear scan (with early exit) through
-   every SSTable file — this is the next real inefficiency to fix.
+3. ~~**Bloom filters**~~ — done.
 4. **Compaction** — background merging of old SSTables into fewer,
    cleaner files, dropping tombstoned/superseded entries. This is the
    hardest and most interesting part of the whole system. Right now
@@ -72,7 +78,7 @@ part most worth being able to explain end to end.
 Requires a C++17 compiler. No external dependencies for the core engine.
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp -o lsmstore
+g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp src/bloomfilter.cpp -o lsmstore
 ./lsmstore
 ```
 
@@ -146,12 +152,25 @@ rediscovered SSTable files, unflushed data comes back from the WAL.
   one on read, rather than mutating the old file. This is what makes
   compaction (Phase 4) a distinct, separable step instead of something
   that has to happen synchronously on every write.
-- **Why point lookups do a linear scan with early exit, for now**: SSTable
-  entries are sorted, so a lookup can stop scanning the moment it passes
-  the target key alphabetically — it doesn't need to read the rest of the
-  file. This is still O(n) in the worst case though; a bloom filter
-  (Phase 3) is what lets a lookup skip opening a file entirely when the
-  key provably isn't in it.
+- **Why point lookups do a linear scan with early exit, for SSTables
+  without a usable filter**: SSTable entries are sorted, so a lookup can
+  stop scanning the moment it passes the target key alphabetically — it
+  doesn't need to read the rest of the file. This is still O(n) in the
+  worst case though, which is exactly what the bloom filter below is for.
+- **Bloom filter: the false-negative bug that almost shipped.** The
+  filter's bit array gets padded up to a whole number of bytes when
+  saved to disk (`(num_bits + 7) / 8` bytes). The first version of the
+  reload path recomputed `num_bits` from that padded byte count instead
+  of persisting the original value — which meant `add()` (at flush time)
+  and `mightContain()` (after a restart) hashed the same key into two
+  *different* bit positions, because they were reducing modulo two
+  different numbers. That silently broke the one guarantee a bloom
+  filter is never allowed to break: no false negatives. It only showed
+  up after a restart, never in the same session, which is exactly the
+  kind of bug that's easy to miss without deliberately testing
+  persistence. Fixed by writing the exact `num_bits` used at build time
+  into the filter file and reusing that same value on reload, instead of
+  re-deriving it from the padded byte array.
 - **Why a skip list over `std::map`**: comparable O(log n) average-case
   performance, but a much simpler mental model, and it extends more
   naturally to lock-free / fine-grained-locking concurrent versions

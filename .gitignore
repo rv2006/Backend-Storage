@@ -1,6 +1,7 @@
 build/
 *.wal
 *.dat
+*.filter
 lsmstore
 lsmstore.exe
 *.o

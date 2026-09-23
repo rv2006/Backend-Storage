@@ -14,6 +14,7 @@ add_executable(lsmstore
     src/main.cpp
     src/wal.cpp
     src/sstable.cpp
+    src/bloomfilter.cpp
 )
 
 target_include_directories(lsmstore PRIVATE include)
