@@ -16,9 +16,19 @@ add_executable(lsmstore
     src/sstable.cpp
     src/bloomfilter.cpp
     src/compaction.cpp
+    src/engine.cpp
 )
-
 target_include_directories(lsmstore PRIVATE include)
+
+add_executable(lsmstore_bench
+    src/benchmark.cpp
+    src/wal.cpp
+    src/sstable.cpp
+    src/bloomfilter.cpp
+    src/compaction.cpp
+    src/engine.cpp
+)
+target_include_directories(lsmstore_bench PRIVATE include)
 
 # --- Tests (optional, requires GoogleTest installed) ---
 option(BUILD_TESTS "Build unit tests" OFF)

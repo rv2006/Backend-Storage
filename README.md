@@ -12,13 +12,12 @@ are built on: how writes get made durable, how data gets kept sorted
 without paying the cost of sorting on every write, and how a background
 process cleans up after itself so reads stay fast over time.
 
-## Current status: Phase 4 of 4 complete (~85-90%) — core architecture done
+## Current status: complete
 
-Every stage of the LSM-tree loop is implemented and working: memtable →
-WAL → SSTable → bloom filter → compaction. What's left is benchmarking
-and polish, not new architecture.
-
-What's implemented and working right now:
+Every stage of the LSM-tree loop is implemented, tested, and benchmarked:
+memtable → WAL → SSTable → bloom filter → compaction, driven through a
+reusable `Engine` class that both the REPL and the benchmark harness
+share. What's implemented and working right now:
 
 - **Write-Ahead Log (`wal.hpp` / `wal.cpp`)** — every write is appended to
   an on-disk log and `fsync`'d *before* it's applied to memory. This is
@@ -66,37 +65,65 @@ What's implemented and working right now:
   in a single file, the old files are actually removed from disk, and
   every key — including the overwritten and deleted ones — resolves
   correctly both immediately after compaction and after a restart.
-- **CLI (`main.cpp`)** — a REPL for `SET`, `GET`, `DEL`, `COUNT`.
+- **`Engine` class (`engine.hpp` / `engine.cpp`)** — the WAL + memtable +
+  SSTable + bloom filter + compaction logic above, originally written
+  inline in `main()`, refactored out into a standalone class with a real
+  API (`set`/`remove`/`get`). This is what makes a benchmark possible at
+  all: driving the engine by typing commands into a REPL can't exercise
+  thousands of operations in a tight timed loop, so the engine needed an
+  API a benchmark (or, later, unit tests) could call directly, not just
+  stdin. No behavior changed in this refactor — verified by re-running
+  the full compaction regression test against the refactored engine and
+  getting byte-for-byte identical output to before the refactor.
+- **CLI (`main.cpp`)** — a thin REPL (`SET`, `GET`, `DEL`, `COUNT`) over
+  `Engine`.
+- **Benchmark (`benchmark.cpp`)** — a standalone throughput harness
+  against the same `Engine` class the REPL uses. See Benchmark results
+  below for real, measured numbers and what they actually show.
 
-## Roadmap (in build order)
+## Roadmap
 
-1. ~~**SSTable flush**~~ — done.
-2. ~~**Multi-file reads**~~ — done.
-3. ~~**Bloom filters**~~ — done.
-4. ~~**Compaction**~~ — done. Currently a *full* compaction (all SSTables
-   merged in one shot) rather than the tiered/leveled strategies real
-   engines use to avoid re-merging the whole dataset every time — a
-   natural next hardening step, not required for the core story.
-5. **Benchmarking** — throughput numbers (writes/sec, reads/sec) using
-   Google Benchmark, and a short write-up of the write/read/space
-   amplification tradeoffs this design makes. This is what's left.
+All planned phases are done:
+
+1. ~~**SSTable flush**~~
+2. ~~**Multi-file reads**~~
+3. ~~**Bloom filters**~~
+4. ~~**Compaction**~~ — currently a *full* compaction (all SSTables merged
+   in one shot) rather than the tiered/leveled strategies real engines
+   use to avoid re-merging the whole dataset every time. A natural next
+   hardening step, not required for the core story.
+5. ~~**Benchmarking**~~
+
+**What a next iteration would add** (see Benchmark results below for
+why): a sparse index per SSTable, so a point lookup on an existing key
+can jump close to it instead of linearly scanning the file from the
+start. The benchmark is what surfaced this as the real next bottleneck,
+not a guess.
 
 ## Building
 
 Requires a C++17 compiler. No external dependencies for the core engine.
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp src/bloomfilter.cpp src/compaction.cpp -o lsmstore
+g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/main.cpp src/wal.cpp src/sstable.cpp src/bloomfilter.cpp src/compaction.cpp src/engine.cpp -o lsmstore
 ./lsmstore
 ```
 
-Or with CMake:
+Or with CMake, which also builds the benchmark (`lsmstore_bench`):
 
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ./lsmstore
+./lsmstore_bench
+```
+
+To build just the benchmark with g++ directly:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -O2 -Iinclude src/benchmark.cpp src/wal.cpp src/sstable.cpp src/bloomfilter.cpp src/compaction.cpp src/engine.cpp -o lsmstore_bench
+./lsmstore_bench
 ```
 
 ## Usage
@@ -140,6 +167,57 @@ was just reset to empty by the flush.
 Kill the process (Ctrl+C) mid-session and restart — every write that
 returned "OK" will still be there: flushed data comes back from the
 rediscovered SSTable files, unflushed data comes back from the WAL.
+
+## Benchmark results
+
+These numbers are from an actual run of `lsmstore_bench` (5,000 writes,
+then 5,000 reads of existing keys, then 5,000 reads of keys that never
+existed), not estimated or made up. Your numbers will vary by machine,
+and the caveat in `benchmark.cpp` applies: `FLUSH_THRESHOLD` (5) and
+`COMPACTION_THRESHOLD` (4) are kept tiny for REPL demoability, so this
+run triggers flush and compaction far more often than a real deployment
+(which would size these in MB) would — these numbers include a lot more
+flush/compaction overhead per operation than a tuned configuration
+would see.
+
+```
+Write:                 5000 writes in 0.53s  =  9,465 writes/sec
+Read (existing keys):  5000 reads  in 8.66s  =    577 reads/sec  (5000/5000 hits)
+                        bloom filter skipped 0 file-scan(s) total
+Read (missing keys):   5000 reads  in 0.13s  = 39,223 reads/sec
+                        bloom filter skipped 4,962 file-scan(s) total (99.2% of reads)
+```
+
+**The interesting finding, and it wasn't the one I expected going in:**
+reads for keys that *exist* are roughly 68x slower than reads for keys
+that *don't*. At first glance that looks backwards — shouldn't finding
+something be at least as fast as not finding it?
+
+The reason is the bloom filter skipped zero files on the hit-read pass.
+By the time reads ran, compaction had already merged everything down to
+a single SSTable (5,000 writes crosses the compaction threshold many
+times over), so every existing key is a "maybe present" for that one
+file's filter — correctly, since it actually is present — which means
+`lookupSSTable()` has to fall through to its linear, early-exit disk
+scan every single time. For a *missing* key, the filter says "definitely
+not present" immediately and the scan never happens at all, which is
+exactly why the miss path is so much faster.
+
+In other words: **the bloom filter is doing its job perfectly — it just
+can't help on hits, only misses, and this benchmark's workload (reusing
+a small pool of 5,000 keys) is almost entirely hits.** The real
+remaining bottleneck is that a *hit* still means an O(n) linear scan of
+a sorted file with no index to jump into it. That's exactly the gap a
+sparse index (key → byte offset, sampled every N entries) would close —
+not by avoiding the scan, but by shrinking it from "whole file" to "a
+small window around where the key should be." That's the concrete,
+benchmark-justified next step if this project continued.
+
+This is also a real, measured example of the LSM-tree **read
+amplification** tradeoff the design accepts in exchange for its write
+path never having to sort data in place: every SSTable file is an extra
+place a read might need to touch, and within a file, no index yet means
+checking it costs more than it should.
 
 ## Design notes / talking points
 
@@ -198,3 +276,15 @@ rediscovered SSTable files, unflushed data comes back from the WAL.
   performance, but a much simpler mental model, and it extends more
   naturally to lock-free / fine-grained-locking concurrent versions
   later, which real memtables need.
+- **Why the engine got pulled out of `main()` into its own class.**
+  Through Phase 4, the entire engine lived as local variables and lambdas
+  inside `main()`, which was fine for a REPL but made it impossible to
+  drive the engine any other way. Benchmarking needs thousands of timed
+  operations in a loop, not one command typed at a time over stdin — so
+  the engine needed a real API. `Engine` is that API: `main.cpp` is now a
+  thin REPL that calls into it, and `benchmark.cpp` calls the exact same
+  class with no duplicated logic. Confirmed the refactor changed no
+  behavior by re-running the full compaction regression test (the same
+  one that caught the bloom filter and fsync bugs) against the
+  refactored engine and diffing the output against the pre-refactor run
+  — identical.

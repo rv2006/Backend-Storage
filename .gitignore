@@ -4,4 +4,6 @@ build/
 *.filter
 lsmstore
 lsmstore.exe
+lsmstore_bench
+lsmstore_bench.exe
 *.o
